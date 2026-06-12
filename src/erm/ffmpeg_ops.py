@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+from collections import defaultdict
 from pathlib import Path
 from typing import Sequence
 
@@ -16,6 +17,47 @@ def ffprobe_duration(path: str | Path) -> float:
         capture_output=True, text=True, check=True,
     ).stdout.strip()
     return float(out)
+
+
+def _probe_audio_stream(path: str | Path) -> tuple[int, int]:
+    """Return ``(sample_rate, channels)`` of the first audio stream.
+
+    Used to mint injected-silence sources (`anullsrc`) that match the kept
+    audio's format exactly, so ffmpeg's `concat` filter — which requires a
+    uniform sample rate and channel layout across its inputs — joins them
+    without resampling the real audio.
+    """
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "a:0",
+         "-show_entries", "stream=sample_rate,channels",
+         "-of", "default=noprint_wrappers=1", str(path)],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    fields: dict[str, str] = {}
+    for line in out.splitlines():
+        if "=" in line:
+            key, _, value = line.partition("=")
+            fields[key.strip()] = value.strip()
+    return int(fields["sample_rate"]), int(fields["channels"])
+
+
+def gap_channel_layout(path: str | Path) -> str:
+    """Return the `anullsrc` ``channel_layout`` name for min-gap injection.
+
+    Only mono and stereo have an unambiguous layout name to mint matching
+    injected-silence (`anullsrc`) sources; for anything else, raise `ValueError`
+    rather than mislabel a multichannel mix as stereo and silently corrupt the
+    output. The CLI calls this up front (before transcription) so a `--min-gap-ms`
+    run on an unsupported input fails fast instead of after the whole pipeline.
+    """
+    _, channels = _probe_audio_stream(path)
+    layout = {1: "mono", 2: "stereo"}.get(channels)
+    if layout is None:
+        raise ValueError(
+            f"min-gap injection supports mono/stereo input only; got {channels} "
+            "channels. Re-run without --min-gap-ms, or downmix the input first."
+        )
+    return layout
 
 
 def extract_segment(input_path: str | Path, start_s: float, end_s: float,
@@ -64,6 +106,41 @@ def overlay_room_tone(audio_path: str | Path, tone_path: str | Path,
     subprocess.run(cmd, check=True, capture_output=True)
 
 
+def _mute_filter(mute_ranges: Sequence[tuple[float, float]]) -> str:
+    """Build an ffmpeg `volume` filter that silences every `mute_ranges` span.
+
+    Produces ``volume=enable='between(t,s1,e1)+between(t,s2,e2)+...':volume=0``
+    — a single timeline-gated pass that zeroes the audio inside each span and
+    leaves everything else byte-identical. An empty `mute_ranges` yields an
+    empty string (no filter needed).
+    """
+    if not mute_ranges:
+        return ""
+    spans = "+".join(f"between(t,{s:.6f},{e:.6f})" for s, e in mute_ranges)
+    return f"volume=enable='{spans}':volume=0"
+
+
+def render_silenced(
+    input_path: str | Path,
+    mute_ranges: Sequence[tuple[float, float]],
+    output_path: str | Path,
+) -> None:
+    """Mute `mute_ranges` in place, preserving the input's exact duration.
+
+    Unlike `render`, this never excises anything — it gates the audio to zero
+    inside each span via a single `volume` pass, so the timeline (and any A/V
+    sync, multi-track alignment, or caption timing keyed to it) is untouched.
+    The muted holes are filled with the natural floor by the room-tone overlay
+    step. Empty `mute_ranges` ⇒ a straight transcode of the input.
+    """
+    mute_filter = _mute_filter(mute_ranges)
+    cmd = ["ffmpeg", "-y", "-i", str(input_path)]
+    if mute_filter:
+        cmd += ["-af", mute_filter]
+    cmd += ["-c:a", "pcm_s16le", str(output_path)]
+    subprocess.run(cmd, check=True, capture_output=True)
+
+
 def _splice_crossfade_s(
     cut_s: float,
     prev_len: float,
@@ -99,55 +176,40 @@ def _splice_crossfade_s(
     return max(0.0, cf)
 
 
-def render(
-    input_path: str | Path,
+def _keep_fades(
     keep_ranges: Sequence[tuple[float, float]],
-    output_path: str | Path,
-    crossfade_ms: float | None = None,
-    min_crossfade_ms: float = 40.0,
-    max_crossfade_ms: float = 80.0,
-    crossfade_factor: float = 0.10,
-    words: Sequence[Word] | None = None,
-) -> None:
-    """Render `keep_ranges` from `input_path` to `output_path` via ffmpeg.
+    words: Sequence[Word] | None,
+    *,
+    crossfade_ms: float | None,
+    min_crossfade_ms: float,
+    max_crossfade_ms: float,
+    crossfade_factor: float,
+    min_gap_s: float = 0.0,
+) -> list[float]:
+    """Per-splice crossfade lengths for each keep→keep join.
 
-    Uses `atrim` + `acrossfade` so each splice gets an equal-power crossfade.
-    The fade length scales with the cut size at that splice — longer cuts
-    splice across audio that differs more in pitch/energy and need a longer
-    fade to mask the transition. Per-splice formula:
+    The per-splice fade computation shared by `render`'s default path and
+    `_render_with_gaps` (the same `_splice_crossfade_s` scaling and word-room
+    clamp), returning a list of length ``len(keep_ranges) - 1`` where entry
+    ``i`` is the fade for the join between keep ``i`` and keep ``i+1``.
 
-        fade = clamp(min_crossfade_ms, cut_ms * crossfade_factor, max_crossfade_ms)
-
-    Pass `crossfade_ms` to override with a single fixed length (legacy /
-    A/B testing); when None, the per-splice scaling is used.
+    When `min_gap_s > 0`, each fade is additionally clamped so it can't pull the
+    two flanking words below the gap floor. A gapless `acrossfade` overlaps the
+    survivors by `fade`, eating that much out of the silence between the words,
+    so the audible gap is ``surviving_gap - fade``; capping ``fade`` at
+    ``surviving_gap - min_gap_s`` keeps that gap ≥ the floor. ``surviving_gap``
+    is ``lhs_room + rhs_room`` — the same per-side silence already measured for
+    the word-protection clamp, and the same quantity `inject_min_gaps` uses, so
+    the two enforcement paths agree: splices below the floor get silence
+    *injected* (a `concat`, no overlap), splices just above it get their
+    crossfade *trimmed* here. With `min_gap_s == 0` (every default run) the
+    clamp is skipped and the fades are byte-for-byte the prior values.
     """
-    if not keep_ranges:
-        raise ValueError("keep_ranges is empty — output would have no audio")
-
-    if len(keep_ranges) == 1:
-        s, e = keep_ranges[0]
-        cmd = ["ffmpeg", "-y", "-i", str(input_path),
-               "-ss", f"{s:.6f}", "-to", f"{e:.6f}",
-               "-c:a", "pcm_s16le", str(output_path)]
-        subprocess.run(cmd, check=True, capture_output=True)
-        return
-
-    fades_s: list[float] = []
+    fades: list[float] = []
     for i in range(1, len(keep_ranges)):
         cut_s = keep_ranges[i][0] - keep_ranges[i - 1][1]
         prev_len = keep_ranges[i - 1][1] - keep_ranges[i - 1][0]
         next_len = keep_ranges[i][1] - keep_ranges[i][0]
-
-        # Word-aware clamp: a crossfade extends ~cf/2 into the audio on
-        # *each* side of the splice. Measure the room back to the nearest
-        # real word on each side so the fade never attenuates one.
-        #
-        # When a side has no word (e.g. a splice past the last word), fall
-        # back to that fragment's own boundary — meaning "no word to protect
-        # here," so this clamp imposes nothing beyond the fragment-length cap
-        # below. Defaulting to the splice point instead would make the room 0,
-        # collapsing this splice's fade and — because render needs *every*
-        # fade > 0 — disabling crossfades for the whole output.
         lhs_room = rhs_room = None
         if words is not None:
             splice_lhs = keep_ranges[i - 1][1]
@@ -162,15 +224,185 @@ def render(
             )
             lhs_room = splice_lhs - prev_word_end
             rhs_room = next_word_start - splice_rhs
-
-        fades_s.append(_splice_crossfade_s(
+        fade = _splice_crossfade_s(
             cut_s, prev_len, next_len,
             crossfade_ms=crossfade_ms,
             min_crossfade_ms=min_crossfade_ms,
             max_crossfade_ms=max_crossfade_ms,
             crossfade_factor=crossfade_factor,
             lhs_room=lhs_room, rhs_room=rhs_room,
-        ))
+        )
+        if min_gap_s > 0 and lhs_room is not None and rhs_room is not None:
+            surviving_gap = lhs_room + rhs_room
+            fade = min(fade, max(0.0, surviving_gap - min_gap_s))
+        fades.append(fade)
+    return fades
+
+
+def _render_with_gaps(
+    input_path: str | Path,
+    keep_ranges: Sequence[tuple[float, float]],
+    output_path: str | Path,
+    gap_inserts: Sequence[tuple[int, float]],
+    *,
+    crossfade_ms: float | None,
+    min_crossfade_ms: float,
+    max_crossfade_ms: float,
+    crossfade_factor: float,
+    words: Sequence[Word] | None,
+    min_gap_s: float = 0.0,
+) -> None:
+    """Render keeps with injected silent gaps, as a linear filtergraph fold.
+
+    Each `gap_inserts` item ``(after_keep_index, duration)`` places a silent
+    segment at the splice following that keep. The graph is folded left to
+    right: keep→keep joins reuse the existing per-splice `acrossfade` (or
+    `concat` when that fade would be zero); any join touching an injected gap
+    uses `concat` so the injected duration lands exactly. Injected silence is
+    an `anullsrc` matched to the input's sample rate / channel layout (the
+    room-tone overlay later fills it with the natural floor).
+
+    `min_gap_s` is forwarded to `_keep_fades` so the surviving (un-injected)
+    crossfades are trimmed to keep their flanking words at or above the floor —
+    the splices that *were* injected already honor it exactly via `concat`.
+    """
+    fades = _keep_fades(
+        keep_ranges, words,
+        crossfade_ms=crossfade_ms,
+        min_crossfade_ms=min_crossfade_ms,
+        max_crossfade_ms=max_crossfade_ms,
+        crossfade_factor=crossfade_factor,
+        min_gap_s=min_gap_s,
+    )
+    sample_rate, _ = _probe_audio_stream(input_path)
+    # The injected `anullsrc` must match the real audio's channel layout so
+    # `concat` joins them without a mismatch (the CLI validates this up front).
+    layout = gap_channel_layout(input_path)
+
+    parts: list[str] = []
+    for i, (s, e) in enumerate(keep_ranges):
+        parts.append(
+            f"[0:a]atrim=start={s:.6f}:end={e:.6f},asetpts=PTS-STARTPTS[k{i}]"
+        )
+
+    gaps_after: dict[int, list[float]] = defaultdict(list)
+    for after_keep_index, duration in gap_inserts:
+        gaps_after[after_keep_index].append(float(duration))
+
+    # Node sequence: each keep, followed by any silent gaps spliced after it.
+    nodes: list[tuple[str, str, int | None]] = []
+    for i in range(len(keep_ranges)):
+        nodes.append(("keep", f"k{i}", i))
+        for j, duration in enumerate(gaps_after.get(i, [])):
+            gap_label = f"g{i}_{j}"
+            parts.append(
+                f"anullsrc=channel_layout={layout}:sample_rate={sample_rate},"
+                f"atrim=duration={duration:.6f},asetpts=PTS-STARTPTS[{gap_label}]"
+            )
+            nodes.append(("gap", gap_label, None))
+
+    if len(nodes) == 1:
+        map_label = nodes[0][1]
+    else:
+        prev_label = nodes[0][1]
+        for n in range(1, len(nodes)):
+            kind, label, keep_index = nodes[n]
+            out_label = "out" if n == len(nodes) - 1 else f"m{n}"
+            prev_kind = nodes[n - 1][0]
+            if prev_kind == "keep" and kind == "keep":
+                fade = fades[keep_index - 1]
+                if fade > 0:
+                    parts.append(
+                        f"[{prev_label}][{label}]"
+                        f"acrossfade=d={fade:.6f}:c1=tri:c2=tri[{out_label}]"
+                    )
+                else:
+                    parts.append(
+                        f"[{prev_label}][{label}]concat=n=2:v=0:a=1[{out_label}]"
+                    )
+            else:
+                parts.append(
+                    f"[{prev_label}][{label}]concat=n=2:v=0:a=1[{out_label}]"
+                )
+            prev_label = out_label
+        map_label = "out"
+
+    filter_complex = ";".join(parts)
+    cmd = ["ffmpeg", "-y", "-i", str(input_path),
+           "-filter_complex", filter_complex,
+           "-map", f"[{map_label}]", "-c:a", "pcm_s16le", str(output_path)]
+    subprocess.run(cmd, check=True, capture_output=True)
+
+
+def render(
+    input_path: str | Path,
+    keep_ranges: Sequence[tuple[float, float]],
+    output_path: str | Path,
+    crossfade_ms: float | None = None,
+    min_crossfade_ms: float = 40.0,
+    max_crossfade_ms: float = 80.0,
+    crossfade_factor: float = 0.10,
+    words: Sequence[Word] | None = None,
+    gap_inserts: Sequence[tuple[int, float]] | None = None,
+    min_gap_s: float = 0.0,
+) -> None:
+    """Render `keep_ranges` from `input_path` to `output_path` via ffmpeg.
+
+    Uses `atrim` + `acrossfade` so each splice gets an equal-power crossfade.
+    The fade length scales with the cut size at that splice — longer cuts
+    splice across audio that differs more in pitch/energy and need a longer
+    fade to mask the transition. Per-splice formula:
+
+        fade = clamp(min_crossfade_ms, cut_ms * crossfade_factor, max_crossfade_ms)
+
+    Pass `crossfade_ms` to override with a single fixed length (legacy /
+    A/B testing); when None, the per-splice scaling is used.
+
+    `gap_inserts` (a list of ``(after_keep_index, duration_s)``) injects silent
+    gaps at specific splices to honor a minimum-gap floor. `min_gap_s` is that
+    floor; when it is set, the gap-aware path runs even with no injections so
+    the surviving crossfades are trimmed not to pull words below the floor (see
+    `_keep_fades`). With both unset/zero (every default run) the verbatim
+    default render path below runs and the output is byte-identical.
+    """
+    if not keep_ranges:
+        raise ValueError("keep_ranges is empty — output would have no audio")
+
+    # Route through the gap-aware path when a gap was injected, or when a floor
+    # is set and there is at least one splice to trim. A single keep has no
+    # splices, so the floor is moot there and the fast path below still applies.
+    if gap_inserts or (min_gap_s > 0 and len(keep_ranges) > 1):
+        _render_with_gaps(
+            input_path, keep_ranges, output_path, gap_inserts or [],
+            crossfade_ms=crossfade_ms,
+            min_crossfade_ms=min_crossfade_ms,
+            max_crossfade_ms=max_crossfade_ms,
+            crossfade_factor=crossfade_factor,
+            words=words,
+            min_gap_s=min_gap_s,
+        )
+        return
+
+    if len(keep_ranges) == 1:
+        s, e = keep_ranges[0]
+        cmd = ["ffmpeg", "-y", "-i", str(input_path),
+               "-ss", f"{s:.6f}", "-to", f"{e:.6f}",
+               "-c:a", "pcm_s16le", str(output_path)]
+        subprocess.run(cmd, check=True, capture_output=True)
+        return
+
+    # Per-splice crossfade lengths. The word-aware clamp inside `_keep_fades`
+    # measures the room back to the nearest real word on each side so a fade
+    # never attenuates one; when a side has no word (e.g. a splice past the
+    # last word) it falls back to that fragment's own boundary, imposing
+    # nothing beyond the fragment-length cap.
+    fades_s = _keep_fades(
+        keep_ranges, words,
+        crossfade_ms=crossfade_ms,
+        min_crossfade_ms=min_crossfade_ms,
+        max_crossfade_ms=max_crossfade_ms,
+        crossfade_factor=crossfade_factor,
+    )
 
     parts: list[str] = []
     for i, (s, e) in enumerate(keep_ranges):

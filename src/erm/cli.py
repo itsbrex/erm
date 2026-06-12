@@ -16,10 +16,22 @@ from .detect import (
     detect_overlong_words,
 )
 from .acoustic import is_sustained_vowel
-from .ffmpeg_ops import denoise_to, extract_segment, overlay_room_tone, render
+from .ffmpeg_ops import (
+    denoise_to,
+    extract_segment,
+    gap_channel_layout,
+    overlay_room_tone,
+    render,
+    render_silenced,
+)
 from .fillers import DEFAULT_FILLERS, find_fillers
 from .models import Cut
-from .ranges import invert_to_keep_ranges, merge_close_cuts
+from .ranges import (
+    inject_min_gaps,
+    invert_to_keep_ranges,
+    merge_close_cuts,
+    pad_cuts,
+)
 from .refine import refine_boundaries
 from .validate import validate_output
 
@@ -58,6 +70,31 @@ def _build_remove_parser() -> argparse.ArgumentParser:
                    help="Merge two cuts whose surviving fragment is shorter "
                         "than this (the fragment would otherwise be eaten "
                         "by the surrounding crossfades and audibly blurp).")
+    p.add_argument("--mode", choices=("remove", "silence"), default="remove",
+                   help="How to apply cuts. 'remove' (default): excise each "
+                        "cut and splice the survivors together (timeline "
+                        "shrinks). 'silence': mute each cut span in place, "
+                        "preserving the original duration exactly (keeps A/V "
+                        "sync, multi-track alignment, and caption timing). The "
+                        "room-tone overlay fills the muted holes with the "
+                        "natural floor.")
+    p.add_argument("--pad-pause-factor", dest="pad_pause_factor", type=float,
+                   default=0.0,
+                   help="remove mode only. Retain this fraction of the silence "
+                        "each cut snapped over, so tight splices keep a little "
+                        "breathing room. 0 (default) removes the whole cut. "
+                        "Never adds time beyond the silence already in the cut.")
+    p.add_argument("--pad-min-ms", dest="pad_min_ms", type=float, default=0.0,
+                   help="Lower clamp on the retained pause per side (ms).")
+    p.add_argument("--pad-max-ms", dest="pad_max_ms", type=float, default=120.0,
+                   help="Upper clamp on the retained pause per side (ms).")
+    p.add_argument("--min-gap-ms", dest="min_gap_ms", type=float, default=0.0,
+                   help="remove mode only. Guarantee at least this much gap "
+                        "between the words flanking each splice, injecting "
+                        "silence when the natural pause is shorter. 0 (default) "
+                        "injects nothing. Adds a little duration when it "
+                        "engages; the room-tone overlay fills the injected "
+                        "silence with the natural floor.")
     p.add_argument("--denoise", choices=("none", "pre", "post", "hybrid"),
                    default="hybrid",
                    help="Background-noise handling. "
@@ -174,6 +211,48 @@ def _timestamped(input_path: str | Path, suffix: str, ext: str) -> Path:
 def _cmd_remove(args: argparse.Namespace) -> int:
     fillers = _parse_filler_set(args.fillers)
 
+    # Validate spacing knobs up front so a bad combination fails immediately
+    # rather than after the (slow) transcribe/refine pass.
+    if args.pad_pause_factor < 0:
+        print("error: --pad-pause-factor must be >= 0", file=sys.stderr)
+        return 2
+    if args.pad_min_ms < 0 or args.pad_max_ms < 0:
+        print("error: --pad-min-ms / --pad-max-ms must be >= 0", file=sys.stderr)
+        return 2
+    if args.pad_min_ms > args.pad_max_ms:
+        print(f"error: --pad-min-ms ({args.pad_min_ms:g}) cannot exceed "
+              f"--pad-max-ms ({args.pad_max_ms:g})", file=sys.stderr)
+        return 2
+    if args.min_gap_ms < 0:
+        print("error: --min-gap-ms must be >= 0", file=sys.stderr)
+        return 2
+    # Min-gap injection mints mono/stereo-only silence sources. Probe the input
+    # now (channel count survives denoising) so an unsupported file fails fast
+    # with a clean message instead of a traceback at the final render step. A
+    # dry run never renders, so the limitation doesn't apply there.
+    if args.mode == "remove" and args.min_gap_ms > 0 and not args.dry_run:
+        try:
+            gap_channel_layout(args.input)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+
+    # The spacing knobs only shape the splices that `remove` mode creates;
+    # `silence` mode makes no splices, so they're inert there. Warn rather than
+    # error so a caller flipping --mode on an existing command line isn't broken.
+    if args.mode == "silence":
+        ignored = [
+            flag
+            for flag, value in (
+                ("--pad-pause-factor", args.pad_pause_factor),
+                ("--min-gap-ms", args.min_gap_ms),
+            )
+            if value > 0
+        ]
+        if ignored:
+            print(f"warning: {' / '.join(ignored)} ignored in --mode silence "
+                  "(they only shape remove-mode splices)", file=sys.stderr)
+
     if not args.output and not args.dry_run:
         args.output = str(_timestamped(args.input, "cleaned", "wav"))
         print(f"      output: {args.output}", file=sys.stderr)
@@ -261,6 +340,15 @@ def _cmd_remove(args: argparse.Namespace) -> int:
             audio, sr, raw_cuts, search_ms=args.search_ms,
             words=words, total_duration=duration,
         )
+        # Pause-proportional padding retains a fraction of the silence each
+        # cut snapped over (remove mode only — silence mode preserves timing
+        # already). Applied before merge_close_cuts, while cuts is still 1:1
+        # with raw_cuts (the invariant pad_cuts relies on).
+        if args.mode == "remove" and args.pad_pause_factor > 0:
+            cuts = pad_cuts(
+                cuts, raw_cuts, args.pad_pause_factor,
+                args.pad_min_ms / 1000.0, args.pad_max_ms / 1000.0,
+            )
     else:
         cuts = []
 
@@ -268,13 +356,38 @@ def _cmd_remove(args: argparse.Namespace) -> int:
     keep = invert_to_keep_ranges(cuts, duration)
     saved = sum(c.end - c.start for c in cuts)
 
+    # Minimum-gap floor (remove mode only): inject silence at any splice whose
+    # natural surviving pause is below the floor. gap_inserts feeds render();
+    # injected is the total added duration (subtracted from the net savings).
+    gap_inserts: list[tuple[int, float]] | None = None
+    injected = 0.0
+    if args.mode == "remove" and args.min_gap_ms > 0 and keep:
+        timeline = inject_min_gaps(keep, words, args.min_gap_ms / 1000.0)
+        gap_inserts = []
+        keep_index = -1
+        for kind, _start, duration in timeline:
+            if kind == "keep":
+                keep_index += 1
+            else:
+                gap_inserts.append((keep_index, duration))
+        injected = sum(duration for _, duration in gap_inserts)
+
     cuts_payload = {
         "input": str(args.input),
         "duration_s": duration,
+        "mode": args.mode,
         "cuts": [c.as_dict() for c in cuts],
         "keep_ranges": [{"start": s, "end": e} for s, e in keep],
-        "time_saved_s": saved,
     }
+    if args.mode == "silence":
+        # Nothing is excised; the cuts are muted in place. No net time saved,
+        # but report how much audio was muted.
+        cuts_payload["injected_gap_s"] = 0.0
+        cuts_payload["muted_s"] = saved
+        cuts_payload["time_saved_s"] = 0.0
+    else:
+        cuts_payload["injected_gap_s"] = injected
+        cuts_payload["time_saved_s"] = saved - injected
 
     if args.json_out:
         Path(args.json_out).write_text(json.dumps(cuts_payload, indent=2))
@@ -286,26 +399,54 @@ def _cmd_remove(args: argparse.Namespace) -> int:
             Path(denoised_path).unlink(missing_ok=True)
         return 0
 
-    if not keep:
+    # The empty-output guard only applies to remove mode (where an empty keep
+    # list means nothing survives). silence mode mutes in place, so even an
+    # all-cut clip still produces a full-duration (muted) output.
+    if args.mode == "remove" and not keep:
         print("error: no audio left after removing fillers", file=sys.stderr)
         if denoised_path is not None:
             Path(denoised_path).unlink(missing_ok=True)
         return 1
 
-    print(f"[4/4] rendering {args.output} ({saved:.2f}s removed)", file=sys.stderr)
     needs_post_denoise = args.denoise == "post"
     needs_room_tone = args.room_tone
+
+    # Warn when the holes (muted spans / injected gaps) would be bare digital
+    # silence rather than the natural room-tone floor. Muting zeroes the span and
+    # denoise only *reduces* signal (never fills a zeroed hole), so room tone is
+    # the only thing that backfills the floor — warn whenever it's off, in any
+    # denoise mode.
+    if args.mode == "silence" and not needs_room_tone:
+        print("warning: --mode silence with --no-room-tone — muted holes will be "
+              "digital silence, not a natural floor", file=sys.stderr)
+    if args.mode == "remove" and injected > 0 and not needs_room_tone:
+        print("warning: --min-gap-ms injects silence at tight splices; without "
+              "room tone those gaps will be digital silence", file=sys.stderr)
+
+    if args.mode == "silence":
+        print(f"[4/4] rendering {args.output} ({saved:.2f}s muted)",
+              file=sys.stderr)
+    else:
+        print(f"[4/4] rendering {args.output} ({saved:.2f}s removed"
+              + (f", {injected:.2f}s gap injected)" if injected > 0 else ")"),
+              file=sys.stderr)
 
     render_target = args.output
     if needs_post_denoise or needs_room_tone:
         render_target = str(_timestamped(args.input, "raw", "wav"))
 
-    render(render_input, keep, render_target,
-           crossfade_ms=args.crossfade_ms,
-           min_crossfade_ms=args.min_crossfade_ms,
-           max_crossfade_ms=args.max_crossfade_ms,
-           crossfade_factor=args.crossfade_factor,
-           words=words)
+    if args.mode == "silence":
+        render_silenced(render_input, [(c.start, c.end) for c in cuts],
+                        render_target)
+    else:
+        render(render_input, keep, render_target,
+               crossfade_ms=args.crossfade_ms,
+               min_crossfade_ms=args.min_crossfade_ms,
+               max_crossfade_ms=args.max_crossfade_ms,
+               crossfade_factor=args.crossfade_factor,
+               words=words,
+               gap_inserts=gap_inserts,
+               min_gap_s=args.min_gap_ms / 1000.0)
 
     current = render_target
     if needs_post_denoise:
