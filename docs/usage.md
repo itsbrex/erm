@@ -33,6 +33,15 @@ timeline staying the same length.**
 natural floor — keep room tone on (the default). Details:
 [render-pipeline.md → Part 2](render-pipeline.md#part-2--mode-remove-vs-silence).
 
+## Decision: audio-only or keep the video?
+
+Feed `erm` a video file and **by default you get the cleaned audio only**
+(`.wav`) — the fast path when you just want the audio. Add `--video` to render a
+synced video output (container inferred from the input), and `--mode silence`
+when captions or lip-sync must stay aligned. The full guide — the `--video` /
+mode / `--video-splice` interactions and the min-gap "plays through" behavior —
+is on its own page: **[working with video](video.md)**.
+
 ## Decision: which `--denoise`?
 
 **Stay on `hybrid` (the default) unless you have a specific reason not to.** It

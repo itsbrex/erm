@@ -17,9 +17,13 @@ from .detect import (
 )
 from .acoustic import is_sustained_vowel
 from .ffmpeg_ops import (
+    _keep_fades,
     denoise_to,
+    extract_audio_wav,
     extract_segment,
+    ffprobe_duration,
     gap_channel_layout,
+    has_video_stream,
     overlay_room_tone,
     render,
     render_silenced,
@@ -34,6 +38,17 @@ from .ranges import (
 )
 from .refine import refine_boundaries
 from .validate import validate_output
+from .video import (
+    VideoInfo,
+    conform_audio_to_duration,
+    encoder_supports_crf,
+    encoder_supports_preset,
+    mux_av,
+    probe_video,
+    render_video_keep_ranges,
+    render_video_with_gaps,
+    video_stream_duration,
+)
 
 
 def _build_remove_parser() -> argparse.ArgumentParser:
@@ -92,6 +107,30 @@ def _build_remove_parser() -> argparse.ArgumentParser:
                         "sync, multi-track alignment, and caption timing). The "
                         "room-tone overlay fills the muted holes with the "
                         "natural floor.")
+    p.add_argument("--video", action="store_true",
+                   help="Render the picture too, keeping A/V in sync, and write "
+                        "a video output whose container is inferred from the "
+                        "input (mp4->mp4, mov->mov...). Default OFF: every input, "
+                        "including a video file, produces the cleaned audio as "
+                        ".wav (the common 'pull the audio out of this video' "
+                        "case). The flags below only apply with --video.")
+    p.add_argument("--video-splice", dest="video_splice",
+                   choices=("crossfade", "cut"), default="crossfade",
+                   help="--video only. How to join kept fragments visually. "
+                        "'crossfade' (default): proportional dissolve matching "
+                        "the audio crossfade at each splice. 'cut': hard jump "
+                        "cuts (audio is hard-cut too, declicked, so A/V can't "
+                        "drift).")
+    p.add_argument("--vcodec", default="libx264",
+                   help="--video only. Video encoder for re-encoded output "
+                        "(remove mode). Default libx264.")
+    p.add_argument("--crf", type=float, default=18.0,
+                   help="--video only. Constant-quality (lower = better/larger); "
+                        "honored by x264/x265, VP9, and AV1 encoders. "
+                        "Default 18 (visually lossless).")
+    p.add_argument("--preset", default="medium",
+                   help="--video only. Encoder speed/efficiency preset. "
+                        "Default medium.")
     p.add_argument("--pad-pause-factor", dest="pad_pause_factor", type=float,
                    default=0.0,
                    help="remove mode only. Retain this fraction of the silence "
@@ -282,12 +321,97 @@ def _cmd_remove(args: argparse.Namespace) -> int:
             print(f"warning: {' / '.join(ignored)} ignored in --mode silence "
                   "(they only shape remove-mode splices)", file=sys.stderr)
 
+    # ----- Video output gating ------------------------------------------------
+    # Video is opt-in (--video). Without it, every input — including a video
+    # file — yields the cleaned audio as .wav (today's behavior, unchanged, and
+    # the common "pull the audio out of this video" case). With --video and a
+    # real video stream present, the output container is inferred from the input.
+    VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".m4v", ".avi"}
+    video_info = probe_video(args.input) if args.video else VideoInfo(has_video=False)
+    render_video = args.video and video_info.has_video
+    if args.video and not video_info.has_video:
+        print("warning: --video given but the input has no motion-video stream; "
+              "writing audio-only output", file=sys.stderr)
+
+    # Warn about video-only knobs passed without --video (inert), mirroring the
+    # silence-mode spacing-knob warning above.
+    if not args.video:
+        vid_ignored = [
+            flag
+            for flag, changed in (
+                ("--video-splice", args.video_splice != "crossfade"),
+                ("--vcodec", args.vcodec != "libx264"),
+                ("--crf", args.crf != 18.0),
+                ("--preset", args.preset != "medium"),
+            )
+            if changed
+        ]
+        if vid_ignored:
+            print(f"warning: {' / '.join(vid_ignored)} ignored without --video",
+                  file=sys.stderr)
+
+    # `-o`'s extension always wins, but a video container without --video is a
+    # footgun (we'd silently write audio into a .mp4); reject it. Conversely a
+    # non-video `-o` with --video can't hold a picture, so fall back to audio.
+    if args.output:
+        out_is_video_container = Path(args.output).suffix.lower() in VIDEO_EXTS
+        if out_is_video_container and not args.video:
+            print(f"error: -o {args.output} names a video container but --video "
+                  "was not given. Add --video to render the picture, or choose a "
+                  ".wav output.", file=sys.stderr)
+            return 2
+        if render_video and not out_is_video_container:
+            print(f"warning: -o {args.output} is not a video container; "
+                  "writing audio-only", file=sys.stderr)
+            render_video = False
+
+    # The picture is only re-encoded (and `--crf`/`--preset` only consulted) in
+    # remove mode. Many encoders honor just one of the two flags or neither —
+    # `_crf_preset_args` drops the unsupported one — so warn when a value the user
+    # *explicitly* changed would be silently ignored, rather than letting it
+    # vanish (mirrors the "ignored without --video" warning above).
+    if render_video and args.mode == "remove":
+        dropped = [
+            flag
+            for flag, changed, supported in (
+                ("--crf", args.crf != 18.0, encoder_supports_crf(args.vcodec)),
+                ("--preset", args.preset != "medium",
+                 encoder_supports_preset(args.vcodec)),
+            )
+            if changed and not supported
+        ]
+        if dropped:
+            print(f"warning: {' / '.join(dropped)} ignored — encoder "
+                  f"{args.vcodec!r} does not support it", file=sys.stderr)
+
+    output_ext = (Path(args.input).suffix.lstrip(".").lower() or "mp4") \
+        if render_video else "wav"
     if not args.output and not args.dry_run:
-        args.output = str(_timestamped(args.input, "cleaned", "wav"))
+        args.output = str(_timestamped(args.input, "cleaned", output_ext))
         print(f"      output: {args.output}", file=sys.stderr)
     if not args.json_out:
         args.json_out = str(_timestamped(args.input, "cuts", "json"))
         print(f"      cuts:   {args.json_out}", file=sys.stderr)
+
+    # When the input carries a real (non-cover-art) video stream, decode its
+    # audio to a temp 16 kHz mono WAV up front. Every librosa-based analysis
+    # below — the numpy gap/intra/overlong detectors and room-tone sampling —
+    # then reads plain PCM instead of falling back to librosa's slow, deprecated
+    # audioread/ffmpeg decoder on the video container. Audio-only inputs are
+    # passed through untouched (byte-identical behavior). This is analysis-only:
+    # rendering and denoising still operate on the full-quality `args.input`.
+    # `probe_video` (run above under --video) already keys off the first video
+    # stream the same way `has_video_stream` does, so reuse its verdict instead
+    # of probing the input a second time; only probe here when --video was off.
+    original_audio = args.input
+    analysis_wav: Path | None = None
+    input_has_video = video_info.has_video if args.video else has_video_stream(args.input)
+    if input_has_video:
+        analysis_wav = _timestamped(args.input, "analysis", "wav")
+        print(f"      extracting audio for analysis -> {analysis_wav}",
+              file=sys.stderr)
+        extract_audio_wav(args.input, analysis_wav)
+        original_audio = str(analysis_wav)
 
     # Denoise stages produce two virtual inputs:
     #   `analysis_input` — what transcribe + audio detectors see
@@ -299,7 +423,7 @@ def _cmd_remove(args: argparse.Namespace) -> int:
     # `post`:   both = original; output is denoised at the end
     # `hybrid`: analysis on original (full detection sensitivity), render from
     #           denoised (clean splices). Best filler coverage AND clean splices.
-    analysis_input = args.input
+    analysis_input = original_audio
     render_input = args.input
     denoised_path: Path | None = None
     if args.denoise in ("pre", "hybrid"):
@@ -312,6 +436,12 @@ def _cmd_remove(args: argparse.Namespace) -> int:
             render_input = str(denoised_path)
         else:  # hybrid
             render_input = str(denoised_path)
+
+    def _cleanup_temps() -> None:
+        """Remove every intermediate temp file this run may have created."""
+        for temp in (analysis_wav, denoised_path):
+            if temp is not None:
+                Path(temp).unlink(missing_ok=True)
 
     print(f"[1/4] transcribing with {args.model}...", file=sys.stderr)
     words, duration = transcribe(
@@ -399,6 +529,14 @@ def _cmd_remove(args: argparse.Namespace) -> int:
                 keep_index += 1
             else:
                 gap_inserts.append((keep_index, duration))
+        # For a video render, snap each injected gap to a whole video frame so
+        # the audio's `anullsrc` silence and the video's played-through footage
+        # inject identical lengths (the conform then fixes only the tiny tail
+        # residual). Audio-only runs keep the exact float durations.
+        if render_video and video_info.fps:
+            fr_snap = video_info.fps
+            gap_inserts = [(idx, round(dur * fr_snap) / fr_snap)
+                           for idx, dur in gap_inserts]
         injected = sum(duration for _, duration in gap_inserts)
 
     cuts_payload = {
@@ -424,8 +562,7 @@ def _cmd_remove(args: argparse.Namespace) -> int:
 
     if args.dry_run:
         print(json.dumps(cuts_payload, indent=2))
-        if denoised_path is not None:
-            Path(denoised_path).unlink(missing_ok=True)
+        _cleanup_temps()
         return 0
 
     # The empty-output guard only applies to remove mode (where an empty keep
@@ -433,8 +570,14 @@ def _cmd_remove(args: argparse.Namespace) -> int:
     # all-cut clip still produces a full-duration (muted) output.
     if args.mode == "remove" and not keep:
         print("error: no audio left after removing fillers", file=sys.stderr)
-        if denoised_path is not None:
-            Path(denoised_path).unlink(missing_ok=True)
+        _cleanup_temps()
+        return 1
+
+    if render_video and video_info.fps is None:
+        print("error: could not determine the input's frame rate; cannot render "
+              "video. Drop --video for audio-only output.",
+              file=sys.stderr)
+        _cleanup_temps()
         return 1
 
     needs_post_denoise = args.denoise == "post"
@@ -460,77 +603,188 @@ def _cmd_remove(args: argparse.Namespace) -> int:
               + (f", {injected:.2f}s gap injected)" if injected > 0 else ")"),
               file=sys.stderr)
 
-    render_target = args.output
+    # For a video render the audio pipeline writes a clean PCM master to a temp
+    # WAV; the picture is muxed onto it into args.output afterward. Audio-only
+    # runs write straight to args.output, exactly as before.
+    audio_dest = args.output
+    if render_video:
+        audio_dest = str(_timestamped(args.input, "audiomaster", "wav"))
+
+    # Frame-snapped per-splice fades, shared verbatim by the audio acrossfade and
+    # the video xfade so both streams shorten identically at each splice. For a
+    # 'cut' splice both streams hard-concat (zero fades). Only computed for a
+    # remove-mode video render; audio-only runs let render() compute internally.
+    fr = video_info.fps
+    video_fades: list[float] | None = None
+    if render_video and args.mode == "remove":
+        if args.video_splice == "cut":
+            video_fades = [0.0] * max(0, len(keep) - 1)
+        else:
+            video_fades = _keep_fades(
+                keep, words,
+                crossfade_ms=args.crossfade_ms,
+                min_crossfade_ms=args.min_crossfade_ms,
+                max_crossfade_ms=args.max_crossfade_ms,
+                crossfade_factor=args.crossfade_factor,
+                min_gap_s=args.min_gap_ms / 1000.0,
+                snap_fps=fr,
+            )
+
+    def _finalize(audio_master: str) -> int:
+        """Mux the picture onto the finished audio master (video runs), or no-op
+        for audio-only, then clean up temps and return 0."""
+        if not render_video:
+            _cleanup_temps()
+            return 0
+        # The render/mux temps (the audio master, the raw video, and any
+        # analysis/denoise intermediates) must be cleaned even if an ffmpeg
+        # render or the mux raises, so the whole body runs under try/finally.
+        video_temp: Path | None = None
+        conformed_audio: Path | None = None
+        try:
+            mux_audio = audio_master
+            if args.mode == "silence":
+                # Silence keeps the original picture frame-for-frame → stream-copy.
+                # The picture stays at the source's video-track length, so conform
+                # the audio master to that exact length for frame-exact A/V parity
+                # (the inverse of remove mode, which conforms the picture instead).
+                video_source: str = args.input
+                mux_vcodec = "copy"
+                video_dur = video_stream_duration(args.input)
+                if video_dur is not None:
+                    conformed_audio = _timestamped(args.input, "audioconf", "wav")
+                    conform_audio_to_duration(audio_master, conformed_audio,
+                                              video_dur)
+                    mux_audio = str(conformed_audio)
+            else:
+                # Remove mode: render the spliced picture (already encoded), then
+                # copy it through the mux (don't re-encode twice).
+                video_temp = _timestamped(args.input, "videoraw",
+                                          Path(args.output).suffix.lstrip("."))
+                print(f"      rendering video ({args.video_splice})...", file=sys.stderr)
+                # Conform the picture to the audio master's sample-exact length so
+                # both streams end frame-for-frame together.
+                target = ffprobe_duration(audio_master)
+                if gap_inserts:
+                    # min-gap: gaps play the real removed footage through, muted.
+                    render_video_with_gaps(
+                        args.input, keep, gap_inserts, video_fades or [], fr,
+                        video_temp, splice_style=args.video_splice,
+                        vcodec=args.vcodec, crf=args.crf, preset=args.preset,
+                        target_duration=target,
+                    )
+                else:
+                    render_video_keep_ranges(
+                        args.input, keep, video_fades or [], fr, video_temp,
+                        splice_style=args.video_splice, vcodec=args.vcodec,
+                        crf=args.crf, preset=args.preset, target_duration=target,
+                    )
+                video_source = str(video_temp)
+                mux_vcodec = "copy"
+            print(f"      muxing video -> {args.output}", file=sys.stderr)
+            mux_av(video_source, mux_audio, args.output, vcodec=mux_vcodec)
+        finally:
+            if video_temp is not None:
+                video_temp.unlink(missing_ok=True)
+            if conformed_audio is not None:
+                conformed_audio.unlink(missing_ok=True)
+            Path(audio_master).unlink(missing_ok=True)
+            _cleanup_temps()
+        return 0
+
+    render_target = audio_dest
     if needs_post_denoise or needs_room_tone:
         render_target = str(_timestamped(args.input, "raw", "wav"))
 
-    if args.mode == "silence":
-        render_silenced(render_input, [(c.start, c.end) for c in cuts],
-                        render_target)
-    else:
-        render(render_input, keep, render_target,
-               crossfade_ms=args.crossfade_ms,
-               min_crossfade_ms=args.min_crossfade_ms,
-               max_crossfade_ms=args.max_crossfade_ms,
-               crossfade_factor=args.crossfade_factor,
-               words=words,
-               gap_inserts=gap_inserts,
-               min_gap_s=args.min_gap_ms / 1000.0)
-
-    current = render_target
-    if needs_post_denoise:
-        print(f"      denoising output...", file=sys.stderr)
-        next_target = (args.output if not needs_room_tone
-                       else str(_timestamped(args.input, "denoised-out", "wav")))
-        denoise_to(current, next_target,
-                   nr=args.denoise_nr, nf=args.denoise_nf)
-        if current != args.output:
-            Path(current).unlink(missing_ok=True)
-        current = next_target
-
-    if needs_room_tone:
-        # Always sample the room tone from the *original* — that's what has
-        # the real ambient character. Denoising would strip it.
-        if args.room_tone_source == "auto":
-            if audio is None:
-                audio, sr = load_audio_mono(args.input)
-            region = find_quiet_region(audio, sr, words)
-            if region is None:
-                print("      room tone: no quiet region found — skipping",
-                      file=sys.stderr)
-                if current != args.output:
-                    Path(args.output).unlink(missing_ok=True)
-                    Path(current).rename(args.output)
-                if denoised_path is not None:
-                    Path(denoised_path).unlink(missing_ok=True)
-                return 0
-            tone_start, tone_end = region
+    # Any ffmpeg op below (the audio render, the post-denoise pass, the room-tone
+    # overlay, or the video render/mux inside `_finalize`) can raise. If one does
+    # mid-pipeline, the audio-master temp and the analysis/denoise intermediates
+    # would otherwise leak, so clean them on the way out before re-raising. The
+    # success path cleans up inside `_finalize`; this only covers the error path.
+    try:
+        if args.mode == "silence":
+            render_silenced(render_input, [(c.start, c.end) for c in cuts],
+                            render_target)
         else:
-            try:
-                tone_start, tone_end = _parse_room_tone_source(args.room_tone_source)
-            except ValueError:
-                print(f"error: invalid --room-tone-source {args.room_tone_source!r}",
-                      file=sys.stderr)
-                if current != args.output:
+            render(render_input, keep, render_target,
+                   crossfade_ms=args.crossfade_ms,
+                   min_crossfade_ms=args.min_crossfade_ms,
+                   max_crossfade_ms=args.max_crossfade_ms,
+                   crossfade_factor=args.crossfade_factor,
+                   words=words,
+                   gap_inserts=gap_inserts,
+                   min_gap_s=args.min_gap_ms / 1000.0,
+                   fades=video_fades)
+
+        current = render_target
+        if needs_post_denoise:
+            print(f"      denoising output...", file=sys.stderr)
+            next_target = (audio_dest if not needs_room_tone
+                           else str(_timestamped(args.input, "denoised-out", "wav")))
+            denoise_to(current, next_target,
+                       nr=args.denoise_nr, nf=args.denoise_nf)
+            if current != audio_dest:
+                Path(current).unlink(missing_ok=True)
+            current = next_target
+
+        if needs_room_tone:
+            # Always sample the room tone from the *original* — that's what has
+            # the real ambient character. Denoising would strip it.
+            skip_overlay = False
+            tone_start = tone_end = 0.0
+            if args.room_tone_source == "auto":
+                if audio is None:
+                    audio, sr = load_audio_mono(original_audio)
+                region = find_quiet_region(audio, sr, words)
+                if region is None:
+                    print("      room tone: no quiet region found — skipping",
+                          file=sys.stderr)
+                    if current != audio_dest:
+                        Path(audio_dest).unlink(missing_ok=True)
+                        Path(current).rename(audio_dest)
+                    skip_overlay = True
+                else:
+                    tone_start, tone_end = region
+            else:
+                try:
+                    tone_start, tone_end = _parse_room_tone_source(args.room_tone_source)
+                except ValueError:
+                    print(f"error: invalid --room-tone-source {args.room_tone_source!r}",
+                          file=sys.stderr)
+                    if current != audio_dest:
+                        Path(current).unlink(missing_ok=True)
+                    if render_video:
+                        Path(audio_dest).unlink(missing_ok=True)
+                    _cleanup_temps()
+                    return 2
+            if not skip_overlay:
+                print(f"      room tone: {tone_start:.2f}-{tone_end:.2f}s "
+                      f"({(tone_end-tone_start)*1000:.0f}ms) "
+                      f"@ {args.room_tone_level_db:.1f}dB", file=sys.stderr)
+                tone_path = _timestamped(args.input, "tone", "wav")
+                extract_segment(args.input, tone_start, tone_end, tone_path)
+                overlay_room_tone(current, tone_path, audio_dest,
+                                  level_db=args.room_tone_level_db)
+                Path(tone_path).unlink(missing_ok=True)
+                if current != audio_dest:
                     Path(current).unlink(missing_ok=True)
-                if denoised_path is not None:
-                    Path(denoised_path).unlink(missing_ok=True)
-                return 2
-        print(f"      room tone: {tone_start:.2f}-{tone_end:.2f}s "
-              f"({(tone_end-tone_start)*1000:.0f}ms) "
-              f"@ {args.room_tone_level_db:.1f}dB", file=sys.stderr)
-        tone_path = _timestamped(args.input, "tone", "wav")
-        extract_segment(args.input, tone_start, tone_end, tone_path)
-        overlay_room_tone(current, tone_path, args.output,
-                          level_db=args.room_tone_level_db)
-        Path(tone_path).unlink(missing_ok=True)
-        if current != args.output:
-            Path(current).unlink(missing_ok=True)
 
-    if denoised_path is not None:
-        Path(denoised_path).unlink(missing_ok=True)
-
-    return 0
+        return _finalize(audio_dest)
+    except BaseException:
+        # render_video → audio_dest is a temp master; audio-only → it's the real
+        # output, which we leave in place (matching prior behavior). Either way
+        # drop the analysis/denoise intermediates. `_finalize` already cleaned
+        # these on its own failure, so these unlinks are idempotent (missing_ok).
+        if render_video:
+            Path(audio_dest).unlink(missing_ok=True)
+        # `render_target` is the `*-raw-*.wav` intermediate when post-denoise or
+        # room-tone is enabled; the success path unlinks it after consuming it,
+        # but a mid-pipeline failure (before that point) would leave it behind.
+        # Drop it here too — idempotent, and skipped when it *is* audio_dest.
+        if render_target != audio_dest:
+            Path(render_target).unlink(missing_ok=True)
+        _cleanup_temps()
+        raise
 
 
 def _cmd_validate(args: argparse.Namespace) -> int:

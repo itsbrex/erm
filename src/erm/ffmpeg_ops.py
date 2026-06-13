@@ -10,11 +10,31 @@ from typing import Sequence
 from .models import Word
 
 
+def run_ffmpeg(cmd: Sequence[str]) -> subprocess.CompletedProcess[str]:
+    """Run an ffmpeg/ffprobe command, surfacing its stderr if it fails.
+
+    ``subprocess.run(..., check=True, capture_output=True)`` swallows ffmpeg's
+    stderr, so a failing render or complex filtergraph surfaces only as a bare
+    ``CalledProcessError`` with no diagnostic. This runs the command and, on a
+    non-zero exit, raises ``RuntimeError`` carrying the tail of ffmpeg's stderr
+    (where the actual error lives) so the failure is debuggable in the field.
+    """
+    proc = subprocess.run(list(cmd), capture_output=True, text=True)
+    if proc.returncode != 0:
+        tail = "\n".join((proc.stderr or "").strip().splitlines()[-20:])
+        raise RuntimeError(
+            f"{cmd[0]} failed (exit {proc.returncode}):\n{tail}"
+        )
+    return proc
+
+
 def ffprobe_duration(path: str | Path) -> float:
-    out = subprocess.run(
+    # Routed through run_ffmpeg so a probe failure surfaces ffprobe's stderr
+    # (a RuntimeError with the diagnostic tail) instead of a bare
+    # CalledProcessError — consistent with every other ffmpeg/ffprobe call here.
+    out = run_ffmpeg(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration",
          "-of", "default=nokey=1:noprint_wrappers=1", str(path)],
-        capture_output=True, text=True, check=True,
     ).stdout.strip()
     return float(out)
 
@@ -27,11 +47,13 @@ def _probe_audio_stream(path: str | Path) -> tuple[int, int]:
     uniform sample rate and channel layout across its inputs — joins them
     without resampling the real audio.
     """
-    out = subprocess.run(
+    # Routed through run_ffmpeg so a probe failure surfaces ffprobe's stderr
+    # instead of a bare CalledProcessError — consistent with every other
+    # ffmpeg/ffprobe call here.
+    out = run_ffmpeg(
         ["ffprobe", "-v", "error", "-select_streams", "a:0",
          "-show_entries", "stream=sample_rate,channels",
          "-of", "default=noprint_wrappers=1", str(path)],
-        capture_output=True, text=True, check=True,
     ).stdout
     fields: dict[str, str] = {}
     for line in out.splitlines():
@@ -60,12 +82,56 @@ def gap_channel_layout(path: str | Path) -> str:
     return layout
 
 
+def has_video_stream(path: str | Path) -> bool:
+    """Return True if `path`'s first video stream is real (non-cover-art) motion.
+
+    ``ffprobe`` reports a still image embedded as cover art (e.g. an mp3's
+    album thumbnail) as a video stream with ``disposition.attached_pic=1``;
+    that is not motion video, so it's excluded. Used to decide whether the
+    input must be routed through :func:`extract_audio_wav` before any
+    librosa-based analysis (which falls back to a slow, deprecated decoder on
+    video containers).
+
+    Probes ``v:0`` only, so it makes the **same** decision as
+    :func:`erm.video.probe_video` (which also keys off the first video stream) —
+    the two never disagree about whether an input "has video".
+    """
+    out = run_ffmpeg(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream_disposition=attached_pic",
+         "-of", "default=noprint_wrappers=1", str(path)],
+    ).stdout
+    # A single `DISPOSITION:attached_pic=<0|1>` line for the first video stream
+    # (none printed when there is no video stream at all). 0 = real motion video.
+    for line in out.splitlines():
+        key, _, value = line.partition("=")
+        if key.strip() == "DISPOSITION:attached_pic" and value.strip() == "0":
+            return True
+    return False
+
+
+def extract_audio_wav(input_path: str | Path, output_path: str | Path,
+                      *, sample_rate: int = 16_000, channels: int = 1) -> None:
+    """Decode `input_path`'s audio to a mono PCM WAV via ffmpeg.
+
+    `-vn` drops any video stream, so this works on video containers (mp4/mov)
+    that librosa's soundfile backend can't open. The result is the canonical
+    analysis input: 16 kHz mono `pcm_s16le` — exactly what the transcriber and
+    the numpy detectors downsample to anyway, so feeding them this WAV loses
+    nothing while avoiding librosa's deprecated `audioread` fallback.
+    """
+    cmd = ["ffmpeg", "-y", "-i", str(input_path), "-vn",
+           "-ac", str(channels), "-ar", str(sample_rate),
+           "-c:a", "pcm_s16le", str(output_path)]
+    run_ffmpeg(cmd)
+
+
 def extract_segment(input_path: str | Path, start_s: float, end_s: float,
                     output_path: str | Path) -> None:
     cmd = ["ffmpeg", "-y", "-i", str(input_path),
            "-ss", f"{start_s:.6f}", "-to", f"{end_s:.6f}",
            "-c:a", "pcm_s16le", str(output_path)]
-    subprocess.run(cmd, check=True, capture_output=True)
+    run_ffmpeg(cmd)
 
 
 def denoise_to(input_path: str | Path, output_path: str | Path,
@@ -79,7 +145,7 @@ def denoise_to(input_path: str | Path, output_path: str | Path,
     cmd = ["ffmpeg", "-y", "-i", str(input_path),
            "-af", f"afftdn=nr={nr}:nf={nf}",
            "-c:a", "pcm_s16le", str(output_path)]
-    subprocess.run(cmd, check=True, capture_output=True)
+    run_ffmpeg(cmd)
 
 
 def overlay_room_tone(audio_path: str | Path, tone_path: str | Path,
@@ -103,7 +169,7 @@ def overlay_room_tone(audio_path: str | Path, tone_path: str | Path,
         "-c:a", "pcm_s16le",
         str(output_path),
     ]
-    subprocess.run(cmd, check=True, capture_output=True)
+    run_ffmpeg(cmd)
 
 
 def _mute_filter(mute_ranges: Sequence[tuple[float, float]]) -> str:
@@ -138,7 +204,7 @@ def render_silenced(
     if mute_filter:
         cmd += ["-af", mute_filter]
     cmd += ["-c:a", "pcm_s16le", str(output_path)]
-    subprocess.run(cmd, check=True, capture_output=True)
+    run_ffmpeg(cmd)
 
 
 def _splice_crossfade_s(
@@ -185,6 +251,7 @@ def _keep_fades(
     max_crossfade_ms: float,
     crossfade_factor: float,
     min_gap_s: float = 0.0,
+    snap_fps: float | None = None,
 ) -> list[float]:
     """Per-splice crossfade lengths for each keep→keep join.
 
@@ -204,6 +271,12 @@ def _keep_fades(
     *injected* (a `concat`, no overlap), splices just above it get their
     crossfade *trimmed* here. With `min_gap_s == 0` (every default run) the
     clamp is skipped and the fades are byte-for-byte the prior values.
+
+    When `snap_fps` is set (a video render), each fade is rounded to a whole
+    video frame (``round(fade·fps)/fps``). The identical snapped list feeds both
+    the audio `acrossfade` and the video `xfade`, so both streams shorten by the
+    same amount at every splice and stay in sync by construction. `snap_fps=None`
+    (every audio-only run) leaves the fades untouched — byte-identical output.
     """
     fades: list[float] = []
     for i in range(1, len(keep_ranges)):
@@ -235,6 +308,16 @@ def _keep_fades(
         if min_gap_s > 0 and lhs_room is not None and rhs_room is not None:
             surviving_gap = lhs_room + rhs_room
             fade = min(fade, max(0.0, surviving_gap - min_gap_s))
+        if snap_fps:
+            # Snap to whole frames. ffmpeg's `xfade` corrupts a chained graph
+            # when a transition is a single frame, so floor any positive fade at
+            # two frames (still a valid audio crossfade — ≥2 frames is ~67-80ms
+            # at 24-30 fps, within the normal crossfade range). A fade that
+            # rounds to zero stays zero (that splice hard-cuts on both streams).
+            frames = round(fade * snap_fps)
+            if frames == 1:
+                frames = 2
+            fade = frames / snap_fps
         fades.append(fade)
     return fades
 
@@ -251,6 +334,7 @@ def _render_with_gaps(
     crossfade_factor: float,
     words: Sequence[Word] | None,
     min_gap_s: float = 0.0,
+    fades: Sequence[float] | None = None,
 ) -> None:
     """Render keeps with injected silent gaps, as a linear filtergraph fold.
 
@@ -266,7 +350,7 @@ def _render_with_gaps(
     crossfades are trimmed to keep their flanking words at or above the floor —
     the splices that *were* injected already honor it exactly via `concat`.
     """
-    fades = _keep_fades(
+    fades = list(fades) if fades is not None else _keep_fades(
         keep_ranges, words,
         crossfade_ms=crossfade_ms,
         min_crossfade_ms=min_crossfade_ms,
@@ -331,7 +415,7 @@ def _render_with_gaps(
     cmd = ["ffmpeg", "-y", "-i", str(input_path),
            "-filter_complex", filter_complex,
            "-map", f"[{map_label}]", "-c:a", "pcm_s16le", str(output_path)]
-    subprocess.run(cmd, check=True, capture_output=True)
+    run_ffmpeg(cmd)
 
 
 def render(
@@ -345,6 +429,7 @@ def render(
     words: Sequence[Word] | None = None,
     gap_inserts: Sequence[tuple[int, float]] | None = None,
     min_gap_s: float = 0.0,
+    fades: Sequence[float] | None = None,
 ) -> None:
     """Render `keep_ranges` from `input_path` to `output_path` via ffmpeg.
 
@@ -364,6 +449,11 @@ def render(
     the surviving crossfades are trimmed not to pull words below the floor (see
     `_keep_fades`). With both unset/zero (every default run) the verbatim
     default render path below runs and the output is byte-identical.
+
+    `fades` overrides the per-splice crossfade lengths (length
+    ``len(keep_ranges) - 1``) instead of computing them internally. A video
+    render passes the same frame-snapped list to both this audio render and the
+    video render so the two streams shorten identically at every splice.
     """
     if not keep_ranges:
         raise ValueError("keep_ranges is empty — output would have no audio")
@@ -380,6 +470,7 @@ def render(
             crossfade_factor=crossfade_factor,
             words=words,
             min_gap_s=min_gap_s,
+            fades=fades,
         )
         return
 
@@ -388,7 +479,7 @@ def render(
         cmd = ["ffmpeg", "-y", "-i", str(input_path),
                "-ss", f"{s:.6f}", "-to", f"{e:.6f}",
                "-c:a", "pcm_s16le", str(output_path)]
-        subprocess.run(cmd, check=True, capture_output=True)
+        run_ffmpeg(cmd)
         return
 
     # Per-splice crossfade lengths. The word-aware clamp inside `_keep_fades`
@@ -396,7 +487,7 @@ def render(
     # never attenuates one; when a side has no word (e.g. a splice past the
     # last word) it falls back to that fragment's own boundary, imposing
     # nothing beyond the fragment-length cap.
-    fades_s = _keep_fades(
+    fades_s = list(fades) if fades is not None else _keep_fades(
         keep_ranges, words,
         crossfade_ms=crossfade_ms,
         min_crossfade_ms=min_crossfade_ms,
@@ -429,4 +520,4 @@ def render(
     cmd = ["ffmpeg", "-y", "-i", str(input_path),
            "-filter_complex", filter_complex,
            "-map", "[out]", "-c:a", "pcm_s16le", str(output_path)]
-    subprocess.run(cmd, check=True, capture_output=True)
+    run_ffmpeg(cmd)

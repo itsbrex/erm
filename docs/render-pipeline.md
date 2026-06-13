@@ -273,3 +273,12 @@ matching duration expectation:
 
 The assumed mode is surfaced in the `duration_math` check detail. See the
 README's `validate` section for the end-user view.
+
+---
+
+# Part 7 — Video render & A/V sync
+
+The `--video` render path — decoupled render + mux, sync by construction (CFR +
+frame-snapped shared fades), the tail conform, min-gap "plays through", codec
+selection, and the forced pixel format — has its own design doc:
+**[video render & A/V sync](video-render.md)**.
