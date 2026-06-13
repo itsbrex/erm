@@ -69,6 +69,13 @@ these **only when they aren't already clear** from the request, then proceed:
 - **Render mode?** `--mode remove` (default — excises fillers, timeline shrinks)
   vs `--mode silence` (mutes in place, **duration preserved** — required for
   video sync and multitrack stems).
+- **Video input — audio or picture?** For a video file, `erm` emits the
+  **cleaned audio only** (`.wav`) by default (the "pull the audio out" case). Add
+  `--video` to render the **picture** too — container inferred from the input,
+  A/V in sync by construction. With `--video`: `--mode silence` stream-copies the
+  picture losslessly (caption/lip-sync safe), `--video-splice {crossfade,cut}`
+  picks the splice style, `--vcodec`/`--crf`/`--preset` tune the re-encode. See
+  the `video` doc.
 
 If the user already implied the answers (e.g. "clean my podcast"), don't ask —
 pick the sensible default and say what you chose.
@@ -84,7 +91,8 @@ Then read the **recipes** doc and use the matching copy-paste command.
    asserts no fillers survive, plus container/duration sanity. Exit 0 = pass.
 
 Useful flags (confirm with `erm --help`): `-o/--output`, `--json`, `--model`,
-`--device`, `--fillers`. The full `usage` doc explains the workflow in depth.
+`--device`, `--fillers`, `--video` (render the picture from a video input). The
+full `usage` doc explains the workflow in depth.
 
 **Adjusting the word list.** If the user wants to strip an extra word (e.g.
 "also remove 'basically' / 'like'"), prefer `--add-fillers "basically,like"` —

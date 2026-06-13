@@ -41,6 +41,14 @@ erm validate input.wav output.wav       # re-transcribe; assert no fillers survi
 - `--mode silence` — mutes in place; **duration preserved** (use for video A/V
   sync and multitrack stems).
 
+**Video inputs:** a video file works like any other recording. By default `erm`
+emits the **cleaned audio only** (`.wav`) — the common "pull the audio out of
+this video" case. Add `--video` to render the **picture** too (container inferred
+from the input; A/V stays in sync by construction). With `--video`, `--mode
+silence` stream-copies the picture losslessly, `--video-splice {crossfade,cut}`
+picks the splice style, and `--vcodec`/`--crf`/`--preset` tune the re-encode.
+See [`docs/video.md`](docs/video.md).
+
 See [`docs/recipes.md`](docs/recipes.md) for copy-paste commands (podcast, video,
 multitrack, noisy room, fastest, max coverage, custom fillers).
 

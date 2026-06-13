@@ -98,8 +98,8 @@ the picture too:
   (default) dissolves each splice, `--video-splice cut` makes hard jump cuts.
 - `--min-gap-ms` with `--video` **plays the removed footage through** the
   injected pause (muted) rather than freezing the frame.
-- Audio is stored losslessly where the container allows (PCM in mov/mkv); mp4
-  gets AAC 256k, webm gets Opus.
+- Audio is stored losslessly where the container allows (PCM in mov/mkv/avi);
+  mp4 gets AAC 256k, webm gets Opus 160k.
 
 See [Modes](#modes) and the
 [video render & A/V sync design doc](docs/video-render.md) for the A/V-sync
@@ -343,6 +343,12 @@ The suite is split into:
   with a stubbed transcriber, wiring transcription → filler detection →
   refinement → range inversion → JSON. Gated on `librosa` (the audio
   loader); skipped automatically if it isn't installed.
+- `test_video.py` — real-ffmpeg checks of the `--video` path: per-stream A/V
+  duration parity (`remove` crossfade/cut and `silence` modes), container/codec
+  inference (`audio_mux_args`), video-stream probing, the `--crf` / `--preset`
+  per-encoder gating and drop warnings, min-gap "plays through", and temp-file
+  cleanup on failure. Skipped automatically when `ffmpeg`/`ffprobe` aren't on
+  PATH.
 
 ## Out of scope
 
