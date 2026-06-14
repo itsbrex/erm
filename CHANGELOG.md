@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-06-14
+
 ### Changed
 
 - **Skill / agent install guidance prefers `uvx`.** The `erm` and `erm-tune`
@@ -127,7 +129,8 @@ additive fields.
 - `erm validate` subcommand: container sanity, duration math, and a
   no-filler-survives invariant.
 
-[Unreleased]: https://github.com/dougcalobrisi/erm/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/dougcalobrisi/erm/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/dougcalobrisi/erm/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/dougcalobrisi/erm/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/dougcalobrisi/erm/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/dougcalobrisi/erm/compare/v0.1.0...v0.1.1
